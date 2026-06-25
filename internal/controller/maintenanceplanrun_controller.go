@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	maintenancev1alpha1 "github.com/ironcore-dev/metal-maintenance-operator/api/v1alpha1"
@@ -125,6 +126,36 @@ func (r *MaintenancePlanRunReconciler) reconcileRun(ctx context.Context, run *ma
 
 		switch status.Phase {
 		case maintenancev1alpha1.StagePhaseSucceeded, maintenancev1alpha1.StagePhaseSkipped:
+			// If this is an intermediate version hop (a later stage of the same kind
+			// exists), immediately suspend it so it doesn't self-remediate past the
+			// version we're about to supersede it with.
+			if status.Phase == maintenancev1alpha1.StagePhaseSucceeded &&
+				run.Spec.DriftPolicy != maintenancev1alpha1.DriftPolicyDisabled {
+				if r.isIntermediateVersionStage(run, i) && status.StageDriftPolicy == "" {
+					status.StageDriftPolicy = maintenancev1alpha1.StageDriftPolicySuspend
+					if isBMCScoped(stage.Kind) {
+						if err := r.patchReconcileMode(ctx, stage.Kind, bmcCRName(run.Name, stage.Name), metalv1alpha1.ReconcileModeSuspend); err != nil {
+							log.FromContext(ctx).Error(err, "failed to suspend intermediate version stage", "stage", stage.Name)
+						}
+					} else {
+						for _, srv := range status.ServerStatuses {
+							if srv.Phase == maintenancev1alpha1.StagePhaseSkipped {
+								continue
+							}
+							name := serverCRName(run.Name, stage.Name, srv.ServerRef.Name)
+							if err := r.patchReconcileMode(ctx, stage.Kind, name, metalv1alpha1.ReconcileModeSuspend); err != nil {
+								log.FromContext(ctx).Error(err, "failed to suspend intermediate server version stage", "stage", stage.Name, "server", srv.ServerRef.Name)
+							}
+						}
+					}
+				}
+			}
+			// Before advancing, check if any earlier Observe-mode stage has drifted.
+			if run.Spec.DriftPolicy == maintenancev1alpha1.DriftPolicyReconcile {
+				if result, drifted, err := r.applyDriftIfFoundUpTo(ctx, run, i); drifted || err != nil {
+					return result, err
+				}
+			}
 			run.Status.CurrentStageIndex = int32(i + 1)
 			continue
 
@@ -134,9 +165,9 @@ func (r *MaintenancePlanRunReconciler) reconcileRun(ctx context.Context, run *ma
 
 		case maintenancev1alpha1.StagePhasePending:
 			if isBMCScoped(stage.Kind) {
-				return r.startBMCStage(ctx, run, stage, status)
+				return r.startBMCStage(ctx, run, stage, status, i)
 			}
-			return r.startServerStage(ctx, run, stage, status)
+			return r.startServerStage(ctx, run, stage, status, i)
 
 		case maintenancev1alpha1.StagePhaseRunning:
 			if isBMCScoped(stage.Kind) {
@@ -165,6 +196,61 @@ func (r *MaintenancePlanRunReconciler) reconcileRun(ctx context.Context, run *ma
 // their terminal state back to Pending (via their own driftPolicy=Observe
 // reconciler). We detect this and either re-activate the child (Reconcile
 // policy) or surface a condition (Observe policy).
+
+// applyDriftIfFoundUpTo checks stages 0..upToIdx (inclusive) for Observe-mode
+// drift and immediately applies DriftPolicyReconcile remediation if found.
+// Returns (result, drifted=true, nil) when drift was found and handled.
+// Returns (zero, false, nil) when no drift — the caller should continue normally.
+// Called from the main stage loop before advancing past a completed stage, so that
+// an earlier drifted stage is always re-run before later stages proceed.
+func (r *MaintenancePlanRunReconciler) applyDriftIfFoundUpTo(
+	ctx context.Context,
+	run *maintenancev1alpha1.MaintenancePlanRun,
+	upToIdx int,
+) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx).WithValues("run", run.Name)
+
+	driftIdx := -1
+	for i := 0; i <= upToIdx; i++ {
+		ss := &run.Status.StageStatuses[i]
+		if ss.StageDriftPolicy != maintenancev1alpha1.StageDriftPolicyObserve {
+			continue
+		}
+		drifted, err := r.stageHasDrifted(ctx, run, &run.Spec.Stages[i], ss)
+		if err != nil {
+			return ctrl.Result{}, false, err
+		}
+		if drifted && driftIdx == -1 {
+			driftIdx = i
+		}
+	}
+
+	if driftIdx == -1 {
+		return ctrl.Result{}, false, nil
+	}
+
+	logger.Info("drift detected while advancing stages — re-executing from drifted stage",
+		"driftedStage", run.Spec.Stages[driftIdx].Name,
+		"currentStage", run.Spec.Stages[upToIdx].Name)
+
+	if err := r.reactivateStageCRs(ctx, run, driftIdx); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	for i := driftIdx; i < len(run.Status.StageStatuses); i++ {
+		run.Status.StageStatuses[i] = maintenancev1alpha1.StageStatus{
+			Name:  run.Spec.Stages[i].Name,
+			Phase: maintenancev1alpha1.StagePhasePending,
+		}
+	}
+	run.Status.Phase = maintenancev1alpha1.MaintenancePlanRunPhaseRunning
+	run.Status.CompletionTime = nil
+	run.Spec.Trigger = maintenancev1alpha1.RunTriggerDriftRemediation
+	apimeta.RemoveStatusCondition(&run.Status.Conditions, maintenancev1alpha1.ConditionTypeDriftDetected)
+	r.Recorder.Eventf(run, corev1.EventTypeWarning, "DriftRemediation",
+		"drift detected at stage %s while advancing past stage %s — re-executing",
+		run.Spec.Stages[driftIdx].Name, run.Spec.Stages[upToIdx].Name)
+	return ctrl.Result{Requeue: true}, true, nil
+}
 func (r *MaintenancePlanRunReconciler) reconcileDrift(ctx context.Context, run *maintenancev1alpha1.MaintenancePlanRun) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("run", run.Name)
 
@@ -193,7 +279,7 @@ func (r *MaintenancePlanRunReconciler) reconcileDrift(ctx context.Context, run *
 	switch run.Spec.DriftPolicy {
 	case maintenancev1alpha1.DriftPolicyReconcile:
 		// Re-activate each child CR from the earliest dirty stage by patching
-		// spec.driftPolicy: "" — the child CR's reconciler then picks it up and
+		// spec.reconcileMode: "" — the child CR's reconciler then picks it up and
 		// re-applies the configuration, preserving condition history.
 		if err := r.reactivateStageCRs(ctx, run, driftIdx); err != nil {
 			return ctrl.Result{}, err
@@ -231,7 +317,24 @@ func (r *MaintenancePlanRunReconciler) reconcileDrift(ctx context.Context, run *
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
-// reactivateStageCRs patches spec.driftPolicy: "" on all child CRs from
+// isIntermediateVersionStage returns true when the stage at stageIdx is a
+// BMCVersion or BIOSVersion and a later stage of the same kind exists.
+// These are intermediate hops that should be suspended once completed so
+// they don't self-remediate back to their version after being superseded.
+func (r *MaintenancePlanRunReconciler) isIntermediateVersionStage(run *maintenancev1alpha1.MaintenancePlanRun, stageIdx int) bool {
+	kind := run.Spec.Stages[stageIdx].Kind
+	if kind != maintenancev1alpha1.StageKindBMCVersion && kind != maintenancev1alpha1.StageKindBIOSVersion {
+		return false
+	}
+	for i := stageIdx + 1; i < len(run.Spec.Stages); i++ {
+		if run.Spec.Stages[i].Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// reactivateStageCRs patches spec.reconcileMode: "" on all child CRs from
 // driftIdx onwards, re-activating them so their reconciler re-applies state.
 // This preserves condition history and avoids orphaned object cleanup.
 func (r *MaintenancePlanRunReconciler) reactivateStageCRs(
@@ -244,7 +347,7 @@ func (r *MaintenancePlanRunReconciler) reactivateStageCRs(
 		ss := &run.Status.StageStatuses[i]
 
 		if isBMCScoped(stage.Kind) {
-			if err := r.patchDriftPolicy(ctx, stage.Kind, bmcCRName(run.Name, stage.Name), metalv1alpha1.DriftPolicyActive); err != nil {
+			if err := r.patchReconcileMode(ctx, stage.Kind, bmcCRName(run.Name, stage.Name), metalv1alpha1.ReconcileModeActive); err != nil {
 				return err
 			}
 		} else {
@@ -253,7 +356,7 @@ func (r *MaintenancePlanRunReconciler) reactivateStageCRs(
 					continue
 				}
 				name := serverCRName(run.Name, stage.Name, srv.ServerRef.Name)
-				if err := r.patchDriftPolicy(ctx, stage.Kind, name, metalv1alpha1.DriftPolicyActive); err != nil {
+				if err := r.patchReconcileMode(ctx, stage.Kind, name, metalv1alpha1.ReconcileModeActive); err != nil {
 					return err
 				}
 			}
@@ -262,12 +365,12 @@ func (r *MaintenancePlanRunReconciler) reactivateStageCRs(
 	return nil
 }
 
-// patchDriftPolicy patches spec.driftPolicy on a single child CR.
-func (r *MaintenancePlanRunReconciler) patchDriftPolicy(
+// patchReconcileMode patches spec.reconcileMode on a single child CR.
+func (r *MaintenancePlanRunReconciler) patchReconcileMode(
 	ctx context.Context,
 	kind maintenancev1alpha1.StageKind,
 	name string,
-	policy metalv1alpha1.DriftPolicy,
+	policy metalv1alpha1.ReconcileMode,
 ) error {
 	key := types.NamespacedName{Name: name}
 	switch kind {
@@ -277,7 +380,7 @@ func (r *MaintenancePlanRunReconciler) patchDriftPolicy(
 			return client.IgnoreNotFound(err)
 		}
 		patch := client.MergeFrom(obj.DeepCopy())
-		obj.Spec.DriftPolicy = policy
+		obj.Spec.ReconcileMode = policy
 		return r.Patch(ctx, obj, patch)
 	case maintenancev1alpha1.StageKindBMCVersion:
 		obj := &metalv1alpha1.BMCVersion{}
@@ -285,7 +388,7 @@ func (r *MaintenancePlanRunReconciler) patchDriftPolicy(
 			return client.IgnoreNotFound(err)
 		}
 		patch := client.MergeFrom(obj.DeepCopy())
-		obj.Spec.DriftPolicy = policy
+		obj.Spec.ReconcileMode = policy
 		return r.Patch(ctx, obj, patch)
 	case maintenancev1alpha1.StageKindBIOSSettings:
 		obj := &metalv1alpha1.BIOSSettings{}
@@ -293,7 +396,7 @@ func (r *MaintenancePlanRunReconciler) patchDriftPolicy(
 			return client.IgnoreNotFound(err)
 		}
 		patch := client.MergeFrom(obj.DeepCopy())
-		obj.Spec.DriftPolicy = policy
+		obj.Spec.ReconcileMode = policy
 		return r.Patch(ctx, obj, patch)
 	case maintenancev1alpha1.StageKindBIOSVersion:
 		obj := &metalv1alpha1.BIOSVersion{}
@@ -301,14 +404,14 @@ func (r *MaintenancePlanRunReconciler) patchDriftPolicy(
 			return client.IgnoreNotFound(err)
 		}
 		patch := client.MergeFrom(obj.DeepCopy())
-		obj.Spec.DriftPolicy = policy
+		obj.Spec.ReconcileMode = policy
 		return r.Patch(ctx, obj, patch)
 	}
 	return nil
 }
 
 // assignStageDriftPolicies records the drift monitoring mode for each completed
-// stage in the run status AND patches the actual child CR's spec.driftPolicy
+// stage in the run status AND patches the actual child CR's spec.reconcileMode
 // so the upstream metal-operator reconciler enforces the same mode.
 func (r *MaintenancePlanRunReconciler) assignStageDriftPolicies(run *maintenancev1alpha1.MaintenancePlanRun) {
 	lastVersionIdx := map[maintenancev1alpha1.StageKind]int{}
@@ -338,7 +441,7 @@ func (r *MaintenancePlanRunReconciler) assignStageDriftPolicies(run *maintenance
 	}
 }
 
-// patchStageDriftPolicies patches spec.driftPolicy on all child CRs once the
+// patchStageDriftPolicies patches spec.reconcileMode on all child CRs once the
 // run has succeeded. Called after assignStageDriftPolicies updates the status.
 // This is a best-effort operation — errors are logged but do not block completion.
 func (r *MaintenancePlanRunReconciler) patchStageDriftPolicies(ctx context.Context, run *maintenancev1alpha1.MaintenancePlanRun) {
@@ -350,16 +453,16 @@ func (r *MaintenancePlanRunReconciler) patchStageDriftPolicies(ctx context.Conte
 		}
 		stage := &run.Spec.Stages[i]
 
-		var driftPolicyValue metalv1alpha1.DriftPolicy
+		var driftPolicyValue metalv1alpha1.ReconcileMode
 		switch ss.StageDriftPolicy {
 		case maintenancev1alpha1.StageDriftPolicyObserve:
-			driftPolicyValue = metalv1alpha1.DriftPolicyObserve
+			driftPolicyValue = metalv1alpha1.ReconcileModeObserve
 		case maintenancev1alpha1.StageDriftPolicySuspend:
-			driftPolicyValue = metalv1alpha1.DriftPolicySuspend
+			driftPolicyValue = metalv1alpha1.ReconcileModeSuspend
 		}
 
 		if isBMCScoped(stage.Kind) {
-			if err := r.patchDriftPolicy(ctx, stage.Kind, bmcCRName(run.Name, stage.Name), driftPolicyValue); err != nil {
+			if err := r.patchReconcileMode(ctx, stage.Kind, bmcCRName(run.Name, stage.Name), driftPolicyValue); err != nil {
 				logger.Error(err, "failed to patch driftPolicy on BMC child CR", "stage", stage.Name)
 			}
 		} else {
@@ -368,7 +471,7 @@ func (r *MaintenancePlanRunReconciler) patchStageDriftPolicies(ctx context.Conte
 					continue
 				}
 				name := serverCRName(run.Name, stage.Name, srv.ServerRef.Name)
-				if err := r.patchDriftPolicy(ctx, stage.Kind, name, driftPolicyValue); err != nil {
+				if err := r.patchReconcileMode(ctx, stage.Kind, name, driftPolicyValue); err != nil {
 					logger.Error(err, "failed to patch driftPolicy on server child CR", "stage", stage.Name, "server", srv.ServerRef.Name)
 				}
 			}
@@ -452,6 +555,7 @@ func (r *MaintenancePlanRunReconciler) startBMCStage(
 	run *maintenancev1alpha1.MaintenancePlanRun,
 	stage *maintenancev1alpha1.PlanStage,
 	status *maintenancev1alpha1.StageStatus,
+	stageIdx int,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("run", run.Name, "stage", stage.Name)
 
@@ -462,7 +566,7 @@ func (r *MaintenancePlanRunReconciler) startBMCStage(
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	obj, err := r.buildBMCObject(run, stage)
+	obj, err := r.buildBMCObject(run, stage, stageIdx)
 	if err != nil {
 		status.Phase = maintenancev1alpha1.StagePhaseFailed
 		status.Message = fmt.Sprintf("failed to build child object: %v", err)
@@ -533,6 +637,7 @@ func (r *MaintenancePlanRunReconciler) startServerStage(
 	run *maintenancev1alpha1.MaintenancePlanRun,
 	stage *maintenancev1alpha1.PlanStage,
 	status *maintenancev1alpha1.StageStatus,
+	stageIdx int,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("run", run.Name, "stage", stage.Name)
 
@@ -562,7 +667,7 @@ func (r *MaintenancePlanRunReconciler) startServerStage(
 			continue
 		}
 
-		obj, err := r.buildServerObject(run, stage, serverName)
+		obj, err := r.buildServerObject(run, stage, serverName, stageIdx)
 		if err != nil {
 			ss.Phase = maintenancev1alpha1.StagePhaseFailed
 			ss.Message = fmt.Sprintf("failed to build child object: %v", err)
@@ -769,11 +874,13 @@ func serverStageVersion(stage *maintenancev1alpha1.PlanStage) string {
 func (r *MaintenancePlanRunReconciler) buildBMCObject(
 	run *maintenancev1alpha1.MaintenancePlanRun,
 	stage *maintenancev1alpha1.PlanStage,
+	stageIdx int,
 ) (client.Object, error) {
 	name := bmcCRName(run.Name, stage.Name)
 	lbls := map[string]string{
-		planRunOwnerLabel: run.Name,
-		stageNameLabel:    stage.Name,
+		planRunOwnerLabel:                        run.Name,
+		stageNameLabel:                           stage.Name,
+		maintenancev1alpha1.StageIndexLabelKey:   strconv.Itoa(stageIdx),
 	}
 
 	switch stage.Kind {
@@ -814,12 +921,14 @@ func (r *MaintenancePlanRunReconciler) buildServerObject(
 	run *maintenancev1alpha1.MaintenancePlanRun,
 	stage *maintenancev1alpha1.PlanStage,
 	serverName string,
+	stageIdx int,
 ) (client.Object, error) {
 	name := serverCRName(run.Name, stage.Name, serverName)
 	lbls := map[string]string{
-		planRunOwnerLabel: run.Name,
-		stageNameLabel:    stage.Name,
-		serverNameLabel:   serverName,
+		planRunOwnerLabel:                        run.Name,
+		stageNameLabel:                           stage.Name,
+		serverNameLabel:                          serverName,
+		maintenancev1alpha1.StageIndexLabelKey:   strconv.Itoa(stageIdx),
 	}
 
 	switch stage.Kind {

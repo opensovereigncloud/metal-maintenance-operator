@@ -26,6 +26,12 @@ const (
 // on one or more completed stages and driftPolicy is Observe.
 const ConditionTypeDriftDetected = "DriftDetected"
 
+// StageIndexLabelKey is set by the MaintenancePlanRun controller on every child CR it creates.
+// The value is the zero-based decimal string index of the stage (e.g. "0", "3").
+// Child controllers in metal-operator read this label to set ServerMaintenance.Spec.Priority,
+// ensuring earlier stages always acquire the server before later ones.
+const StageIndexLabelKey = "maintenance.metal.ironcore.dev/stage-index"
+
 // RunTrigger indicates why a MaintenancePlanRun was created.
 // +kubebuilder:validation:Enum=Initial;DriftRemediation
 type RunTrigger string
