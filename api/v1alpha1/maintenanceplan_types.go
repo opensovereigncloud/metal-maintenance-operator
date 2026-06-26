@@ -9,23 +9,6 @@ import (
 	metalv1alpha1 "github.com/ironcore-dev/metal-operator/api/v1alpha1"
 )
 
-// DriftPolicy controls how a completed MaintenancePlanRun responds when a child
-// CR regresses from a terminal state back to Pending (indicating out-of-band change).
-// +kubebuilder:validation:Enum=Reconcile;Observe;Disabled
-type DriftPolicy string
-
-const (
-	// DriftPolicyReconcile means the run controller re-executes from the earliest
-	// dirty stage whenever drift is detected.
-	DriftPolicyReconcile DriftPolicy = "Reconcile"
-	// DriftPolicyObserve means the run controller surfaces a DriftDetected condition
-	// but takes no hardware action.
-	DriftPolicyObserve DriftPolicy = "Observe"
-	// DriftPolicyDisabled means drift is not monitored. The run stays in its terminal
-	// phase and the child CRs are not watched after completion.
-	DriftPolicyDisabled DriftPolicy = "Disabled"
-)
-
 // StageKind identifies which metal-operator child CRD a stage targets.
 // +kubebuilder:validation:Enum=BMCSettings;BMCVersion;BIOSSettings;BIOSVersion
 type StageKind string
@@ -91,13 +74,6 @@ type MaintenancePlanSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +required
 	Stages []PlanStage `json:"stages"`
-
-	// DriftPolicy controls how the run controller responds when a completed child CR
-	// regresses back to Pending after the run has succeeded.
-	// Defaults to Disabled so drift monitoring must be explicitly opted in to.
-	// +kubebuilder:default=Disabled
-	// +optional
-	DriftPolicy DriftPolicy `json:"driftPolicy,omitempty"`
 }
 
 // MaintenancePlanPhase represents the overall lifecycle state of a MaintenancePlan.

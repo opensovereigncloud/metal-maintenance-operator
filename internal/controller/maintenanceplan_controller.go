@@ -201,7 +201,6 @@ func (r *MaintenancePlanReconciler) buildRun(
 			ServerRefs:           serverRefs,
 			BaselineBMCVersion:   group.bmc.Status.FirmwareVersion,
 			BaselineBIOSVersions: baselineBIOSVersions,
-			DriftPolicy:          plan.Spec.DriftPolicy,
 			Trigger:              maintenancev1alpha1.RunTriggerInitial,
 			Stages:               plan.Spec.Stages,
 		},

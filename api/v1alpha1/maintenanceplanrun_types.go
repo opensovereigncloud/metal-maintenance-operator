@@ -6,25 +6,8 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
-
-// StageDriftPolicy records what drift monitoring mode is active for a completed stage's
-// child CR. Set by the run controller after each stage succeeds.
-// +kubebuilder:validation:Enum=Observe;Suspend;""
-type StageDriftPolicy string
-
-const (
-	// StageDriftPolicyObserve means the child CR is watched for regressions.
-	// Applied to terminal version stages and all settings stages.
-	StageDriftPolicyObserve StageDriftPolicy = "Observe"
-	// StageDriftPolicySuspend means the child CR is superseded (an intermediate
-	// version hop) and regressions to it are not meaningful.
-	StageDriftPolicySuspend StageDriftPolicy = "Suspend"
-)
-
-// ConditionTypeDriftDetected is set on a MaintenancePlanRun when drift is detected
-// on one or more completed stages and driftPolicy is Observe.
-const ConditionTypeDriftDetected = "DriftDetected"
 
 // StageIndexLabelKey is set by the MaintenancePlanRun controller on every child CR it creates.
 // The value is the zero-based decimal string index of the stage (e.g. "0", "3").
@@ -33,16 +16,13 @@ const ConditionTypeDriftDetected = "DriftDetected"
 const StageIndexLabelKey = "maintenance.metal.ironcore.dev/stage-index"
 
 // RunTrigger indicates why a MaintenancePlanRun was created.
-// +kubebuilder:validation:Enum=Initial;DriftRemediation
+// +kubebuilder:validation:Enum=Initial
 type RunTrigger string
 
 const (
 	// RunTriggerInitial means this run was created as part of the first-time
 	// maintenance pipeline for the BMC.
 	RunTriggerInitial RunTrigger = "Initial"
-	// RunTriggerDriftRemediation means this run was created to remediate drift
-	// detected on a previously completed run.
-	RunTriggerDriftRemediation RunTrigger = "DriftRemediation"
 )
 
 // MaintenancePlanRunPhase represents the lifecycle state of a single MaintenancePlanRun.
@@ -136,10 +116,10 @@ type StageStatus struct {
 	// +optional
 	Message string `json:"message,omitempty"`
 
-	// StageDriftPolicy records the drift monitoring mode applied to this stage's
-	// child CR after completion. Empty while the stage is pending or running.
+	// AppliedSpec is a snapshot of the child CR's spec at the time it completed.
+	// Populated before intermediate-hop CRs are deleted so the run retains a full audit record.
 	// +optional
-	StageDriftPolicy StageDriftPolicy `json:"stageDriftPolicy,omitempty"`
+	AppliedSpec *runtime.RawExtension `json:"appliedSpec,omitempty"`
 }
 
 // MaintenancePlanRunSpec defines the input for a single BMC's maintenance run.
@@ -170,12 +150,6 @@ type MaintenancePlanRunSpec struct {
 	// skip evaluation for Server-scoped stages.
 	// +optional
 	BaselineBIOSVersions map[string]string `json:"baselineBIOSVersions,omitempty"`
-
-	// DriftPolicy is copied from the parent MaintenancePlan at run creation time.
-	// Controls whether and how the controller monitors completed stages for regressions.
-	// +kubebuilder:default=Disabled
-	// +optional
-	DriftPolicy DriftPolicy `json:"driftPolicy,omitempty"`
 
 	// Trigger records why this run was created.
 	// +kubebuilder:default=Initial

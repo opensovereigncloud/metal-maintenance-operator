@@ -4,6 +4,8 @@
 package controller
 
 import (
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -95,7 +97,7 @@ var _ = Describe("buildBMCObject (unit)", func() {
 		run := minimalRunForUnit("bmc", "srv")
 		_, err := r.buildBMCObject(run, &maintenancev1alpha1.PlanStage{
 			Name: "s", Kind: maintenancev1alpha1.StageKindBIOSVersion,
-		})
+		}, 0)
 		Expect(err).To(MatchError(ContainSubstring("not BMC-scoped")))
 	})
 
@@ -110,7 +112,7 @@ var _ = Describe("buildBMCObject (unit)", func() {
 				},
 			},
 		}
-		obj, err := r.buildBMCObject(run, stage)
+		obj, err := r.buildBMCObject(run, stage, 0)
 		Expect(err).NotTo(HaveOccurred())
 		bmcSettings, ok := obj.(*metalv1alpha1.BMCSettings)
 		Expect(ok).To(BeTrue())
@@ -132,7 +134,7 @@ var _ = Describe("buildBMCObject (unit)", func() {
 				},
 			},
 		}
-		obj, err := r.buildBMCObject(run, stage)
+		obj, err := r.buildBMCObject(run, stage, 0)
 		Expect(err).NotTo(HaveOccurred())
 		bmcVersion, ok := obj.(*metalv1alpha1.BMCVersion)
 		Expect(ok).To(BeTrue())
@@ -146,7 +148,7 @@ var _ = Describe("buildBMCObject (unit)", func() {
 			Name:     "s",
 			Kind:     maintenancev1alpha1.StageKindBMCSettings,
 			Template: maintenancev1alpha1.StageTemplate{BMCSettings: nil},
-		})
+		}, 0)
 		Expect(err).To(MatchError(ContainSubstring("missing bmcSettings template")))
 	})
 
@@ -156,7 +158,7 @@ var _ = Describe("buildBMCObject (unit)", func() {
 			Name:     "s",
 			Kind:     maintenancev1alpha1.StageKindBMCVersion,
 			Template: maintenancev1alpha1.StageTemplate{BMCVersion: nil},
-		})
+		}, 0)
 		Expect(err).To(MatchError(ContainSubstring("missing bmcVersion template")))
 	})
 })
@@ -168,7 +170,7 @@ var _ = Describe("buildServerObject (unit)", func() {
 		run := minimalRunForUnit("bmc", "srv")
 		_, err := r.buildServerObject(run, &maintenancev1alpha1.PlanStage{
 			Name: "s", Kind: maintenancev1alpha1.StageKindBMCVersion,
-		}, "my-server")
+		}, "my-server", 0)
 		Expect(err).To(MatchError(ContainSubstring("not Server-scoped")))
 	})
 
@@ -184,7 +186,7 @@ var _ = Describe("buildServerObject (unit)", func() {
 				},
 			},
 		}
-		obj, err := r.buildServerObject(run, stage, "my-srv")
+		obj, err := r.buildServerObject(run, stage, "my-srv", 0)
 		Expect(err).NotTo(HaveOccurred())
 		biosSettings, ok := obj.(*metalv1alpha1.BIOSSettings)
 		Expect(ok).To(BeTrue())
@@ -205,7 +207,7 @@ var _ = Describe("buildServerObject (unit)", func() {
 				},
 			},
 		}
-		obj, err := r.buildServerObject(run, stage, "my-srv")
+		obj, err := r.buildServerObject(run, stage, "my-srv", 0)
 		Expect(err).NotTo(HaveOccurred())
 		biosVersion, ok := obj.(*metalv1alpha1.BIOSVersion)
 		Expect(ok).To(BeTrue())
@@ -219,7 +221,7 @@ var _ = Describe("buildServerObject (unit)", func() {
 			Name:     "s",
 			Kind:     maintenancev1alpha1.StageKindBIOSSettings,
 			Template: maintenancev1alpha1.StageTemplate{BIOSSettings: nil},
-		}, "srv")
+		}, "srv", 0)
 		Expect(err).To(MatchError(ContainSubstring("missing biosSettings template")))
 	})
 
@@ -229,9 +231,54 @@ var _ = Describe("buildServerObject (unit)", func() {
 			Name:     "s",
 			Kind:     maintenancev1alpha1.StageKindBIOSVersion,
 			Template: maintenancev1alpha1.StageTemplate{BIOSVersion: nil},
-		}, "srv")
+		}, "srv", 0)
 		Expect(err).To(MatchError(ContainSubstring("missing biosVersion template")))
 	})
+})
+
+var _ = Describe("isIntermediateStage (unit)", func() {
+	r := &MaintenancePlanRunReconciler{}
+
+	makeRun := func(kinds ...maintenancev1alpha1.StageKind) *maintenancev1alpha1.MaintenancePlanRun {
+		run := minimalRunForUnit("bmc", "srv")
+		for i, k := range kinds {
+			run.Spec.Stages = append(run.Spec.Stages, maintenancev1alpha1.PlanStage{
+				Name: fmt.Sprintf("s%d", i), Kind: k,
+			})
+		}
+		return run
+	}
+
+	DescribeTable("detects intermediate stages across all kinds",
+		func(kinds []maintenancev1alpha1.StageKind, idx int, wantIntermediate bool) {
+			run := makeRun(kinds...)
+			Expect(r.isIntermediateStage(run, idx)).To(Equal(wantIntermediate))
+		},
+		Entry("BMCVersion intermediate", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBMCVersion, maintenancev1alpha1.StageKindBMCVersion,
+		}, 0, true),
+		Entry("BMCVersion final", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBMCVersion, maintenancev1alpha1.StageKindBMCVersion,
+		}, 1, false),
+		Entry("BIOSVersion intermediate", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBIOSVersion, maintenancev1alpha1.StageKindBIOSVersion,
+		}, 0, true),
+		Entry("BMCSettings intermediate", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBMCSettings, maintenancev1alpha1.StageKindBMCSettings,
+		}, 0, true),
+		Entry("BMCSettings final", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBMCSettings, maintenancev1alpha1.StageKindBMCSettings,
+		}, 1, false),
+		Entry("BIOSSettings intermediate", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBIOSSettings, maintenancev1alpha1.StageKindBIOSSettings,
+		}, 0, true),
+		Entry("only stage is not intermediate", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBMCVersion,
+		}, 0, false),
+		Entry("different kinds are not intermediate", []maintenancev1alpha1.StageKind{
+			maintenancev1alpha1.StageKindBMCVersion, maintenancev1alpha1.StageKindBIOSVersion,
+		}, 0, false),
+	)
 })
 
 var _ = Describe("shouldSkipBMC (unit)", func() {
